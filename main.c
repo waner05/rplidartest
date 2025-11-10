@@ -140,6 +140,136 @@ static HAL_StatusTypeDef RPLIDAR_GetDeviceInfo(void) {
   return HAL_OK;
 }
 
+typedef struct {
+  uint16_t angle_q6;     // angle * 64
+  uint16_t dist_q2;      // distance * 4 (quarter-mm)
+  uint8_t  quality;      // 0..255
+  uint8_t  start_flag;   // 1 when this sample is the first of a new scan
+  uint8_t  valid;        // 1 if C-bit & S-bits look OK and dist != 0
+} RPLidarSample;
+
+static HAL_StatusTypeDef RPLIDAR_Stop(void) {
+  const uint8_t stop_cmd[2] = {0xA5, 0x25};
+  return HAL_UART_Transmit(&huart1, (uint8_t*)stop_cmd, 2, 100);
+}
+
+/* Legacy SCAN: A5 20; expect descriptor A5 5A 05 00 00 40 81 and then 5-byte nodes */
+static HAL_StatusTypeDef RPLIDAR_StartScan(void) {
+  const uint8_t scan_cmd[2] = {0xA5, 0x20};
+  uint8_t desc[7] = {0};
+
+  printf("\r\n[RPLIDAR] Sending SCAN (A5 20)...\r\n");
+  HAL_StatusTypeDef st = HAL_UART_Transmit(&huart1, (uint8_t*)scan_cmd, 2, 100);
+  if (st != HAL_OK) { printf("[RPLIDAR] TX failed: %d\r\n", (int)st); return st; }
+
+  st = HAL_UART_Receive(&huart1, desc, sizeof(desc), 2000);
+  if (st != HAL_OK) { printf("[RPLIDAR] RX descriptor failed: %d\r\n", (int)st); return st; }
+
+  printf("[RPLIDAR] SCAN descriptor: ");
+  for (int i=0;i<7;i++){ printf("%02X%s", desc[i], i==6?"\r\n":" "); }
+
+  /* Expect: A5 5A 05 00 00 40 81 (5-byte multiple response) */
+  int ok = (desc[0]==0xA5 && desc[1]==0x5A && desc[2]==0x05 && desc[3]==0x00 &&
+            desc[4]==0x00 && desc[5]==0x40 /* variable */ );
+  if (!ok) {
+    printf("[RPLIDAR] Unexpected scan descriptor\r\n");
+    return HAL_ERROR;
+  }
+  return HAL_OK;
+}
+
+/* Parse one 5-byte node */
+static RPLidarSample RPLIDAR_ParseNode(const uint8_t n[5]) {
+  RPLidarSample s = {0};
+
+  uint8_t b0 = n[0], b1 = n[1], b2 = n[2], b3 = n[3], b4 = n[4];
+
+  uint8_t S     =  (b0 & 0x01);
+  uint8_t notS  = ((b0 >> 1) & 0x01);
+  uint8_t Cbit  =  (b1 & 0x01);
+
+  s.quality     =  (b0 >> 2);
+  s.start_flag  =  (S == 1) && (notS == 0);
+
+  /* valid when C==1 and S/notS are complements */
+  uint8_t s_bits_ok = ((S ^ notS) == 1);
+
+  /* angle_q6: 7 bits from b1[7:1] + 8 bits from b2 */
+  s.angle_q6    = ((uint16_t)b2 << 7) | (b1 >> 1);
+
+  /* dist_q2: little-endian quarter-mm */
+  s.dist_q2     = ((uint16_t)b4 << 8) | b3;
+
+  s.valid = (Cbit == 1) && s_bits_ok && (s.dist_q2 != 0);
+
+  return s;
+}
+
+
+
+/* Read one byte with short timeout, clearing ORE on demand */
+static HAL_StatusTypeDef uart_read_u8_clear_ore(uint8_t *b, uint32_t tout_ms) {
+  HAL_StatusTypeDef st = HAL_UART_Receive(&huart1, b, 1, tout_ms);
+  if (st != HAL_OK) {
+    /* If we timed out or hit an error, clear possible overrun so RX can resume */
+    __HAL_UART_CLEAR_OREFLAG(&huart1);
+  }
+  return st;
+}
+
+/* Start SCAN, allow spin-up, read nodes with sliding window + resync */
+static HAL_StatusTypeDef RPLIDAR_SimpleScanAndPrint(uint32_t nodes_to_read) {
+  HAL_StatusTypeDef st = RPLIDAR_StartScan();
+  if (st != HAL_OK) return st;
+
+  /* let the motor reach speed */
+  HAL_Delay(900);
+
+  printf("[RPLIDAR] Reading nodes (byte-by-byte, resync)...\r\n");
+
+  uint8_t buf[5] = {0};
+  int idx = 0;
+  uint32_t valid_cnt = 0, printed = 0, saw_new_scan = 0;
+
+  while (nodes_to_read) {
+    uint8_t ch;
+    st = uart_read_u8_clear_ore(&ch, 30);      // short per-byte timeout
+    if (st != HAL_OK) {
+      // brief gap in stream; keep trying a bit longer
+      continue;
+    }
+
+    buf[idx] = ch;
+    idx = (idx + 1) % 5;
+
+    /* candidate node n[0..4] oldest..newest */
+    uint8_t n[5] = { buf[idx], buf[(idx+1)%5], buf[(idx+2)%5], buf[(idx+3)%5], buf[(idx+4)%5] };
+    RPLidarSample s = RPLIDAR_ParseNode(n);
+
+    if (s.valid) {
+      nodes_to_read--;
+      valid_cnt++;
+      if (s.start_flag) saw_new_scan++;
+
+      if ((printed % 40) == 0) {
+        float angle_deg = s.angle_q6 / 64.0f;
+        float dist_mm   = s.dist_q2  / 4.0f;
+        printf("  ang=%7.2f deg  dist=%7.1f mm  qual=%3u %s\r\n",
+               angle_deg, dist_mm, s.quality, s.start_flag ? "<NEW_SCAN>" : "");
+      }
+      printed++;
+    }
+  }
+
+  printf("[RPLIDAR] Stopping scan...\r\n");
+  RPLIDAR_Stop();
+  printf("[RPLIDAR] Done. Valid nodes=%lu, new-scan flags=%lu\r\n",
+         (unsigned long)valid_cnt, (unsigned long)saw_new_scan);
+
+  return (valid_cnt > 0) ? HAL_OK : HAL_TIMEOUT;
+}
+
+
 /* USER CODE END 0 */
 
 /**
@@ -174,16 +304,23 @@ int main(void)
   MX_USART1_UART_Init();
   MX_LPUART1_UART_Init();
   /* USER CODE BEGIN 2 */
-  HAL_StatusTypeDef st = RPLIDAR_GetDeviceInfo();
+  HAL_StatusTypeDef st;
+
+  st = RPLIDAR_GetDeviceInfo();
+  if (st != HAL_OK) {
+    printf("[RPLIDAR] GetDeviceInfo failed, aborting.\r\n");
+    while (1) { HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_7); HAL_Delay(600); }
+  }
+
+  /* Make sure the motor is powered/spinning before scan.
+     If you control it via a GPIO/PWM, enable that here and give it ~1s. */
+  HAL_Delay(1200);
+
+  st = RPLIDAR_SimpleScanAndPrint(1000);  // read ~1000 nodes and print a subset
   if (st == HAL_OK) {
-    // success: 5 quick blinks
     blink_ok(5);
   } else {
-    // failure: slow blink forever
-    while (1) {
-      HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_7);
-      HAL_Delay(600);
-    }
+    while (1) { HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_7); HAL_Delay(600); }
   }
   /* USER CODE END 2 */
 
