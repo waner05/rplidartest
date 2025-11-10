@@ -58,6 +58,20 @@ static void MX_LPUART1_UART_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+static void print_hex(const char *label, const uint8_t *buf, uint32_t len) {
+  printf("%s", label);
+  for (uint32_t i = 0; i < len; i++) {
+    printf("%02X", buf[i]);
+    if (i + 1 < len) printf(" ");
+  }
+  printf("\r\n");
+}
+
+static void print_serial(const uint8_t *s) {
+  // 16-byte serial; print as hex without spaces
+  for (int i = 0; i < 16; i++) printf("%02X", s[i]);
+}
+
 static void blink_ok(int n) {
   for (int i = 0; i < n; i++) {
     HAL_GPIO_TogglePin(GPIOB, GPIO_PIN_7);
@@ -68,31 +82,64 @@ static void blink_ok(int n) {
 }
 
 static HAL_StatusTypeDef RPLIDAR_GetDeviceInfo(void) {
-  uint8_t cmd[2] = {0xA5, 0x50};    // GET_DEVICE_INFO
-  uint8_t desc[7] = {0};
+  uint8_t cmd[2]      = {0xA5, 0x50}; // GET_DEVICE_INFO
+  uint8_t desc[7]     = {0};
   uint8_t payload[20] = {0};
+
+  // Clear possible overrun before starting
+  __HAL_UART_CLEAR_OREFLAG(&huart1);
+
+  printf("\r\n[RPLIDAR] Sending GET_DEVICE_INFO (A5 50)...\r\n");
 
   // Send command
   HAL_StatusTypeDef st = HAL_UART_Transmit(&huart1, cmd, sizeof(cmd), 100);
-  if (st != HAL_OK) return st;
+  if (st != HAL_OK) {
+    printf("[RPLIDAR] TX failed: %d\r\n", (int)st);
+    return st;
+  }
 
-  // Read 7-byte descriptor (expect A5 5A 14 00 00 00 xx)
-  st = HAL_UART_Receive(&huart1, desc, sizeof(desc), 1000);
-  if (st != HAL_OK) return st;
+  // Read 7-byte descriptor (NO PRINTS BEFORE PAYLOAD!)
+  st = HAL_UART_Receive(&huart1, desc, sizeof(desc), 2000);
+  if (st != HAL_OK) {
+    printf("[RPLIDAR] RX descriptor failed: %d (timeout?)\r\n", (int)st);
+    return st;
+  }
 
+  // Validate header quickly (still avoid prints)
   int header_ok = (desc[0]==0xA5 && desc[1]==0x5A &&
                    desc[2]==0x14 && desc[3]==0x00 && desc[4]==0x00 && desc[5]==0x00);
-  if (!header_ok) return HAL_ERROR;
+  if (!header_ok) {
+    printf("[RPLIDAR] Descriptor unexpected (expect A5 5A 14 00 00 00 xx)\r\n");
+    return HAL_ERROR;
+  }
 
-  // Read 20-byte payload
-  st = HAL_UART_Receive(&huart1, payload, sizeof(payload), 1000);
-  if (st != HAL_OK) return st;
+  // Read 20-byte payload immediately
+  st = HAL_UART_Receive(&huart1, payload, sizeof(payload), 2000);
+  if (st != HAL_OK) {
+    printf("[RPLIDAR] RX payload failed: %d\r\n", (int)st);
+    return st;
+  }
 
-  // (Optional) put a breakpoint here to inspect payload: model/fw/hw/serial
-  (void)payload;
+  // Now it's safe to print a lot
+  print_hex("[RPLIDAR] Descriptor: ", desc, sizeof(desc));
+  print_hex("[RPLIDAR] Payload:    ", payload, sizeof(payload));
+
+  uint8_t model    = payload[0];
+  uint8_t fw_minor = payload[1];
+  uint8_t fw_major = payload[2];
+  uint8_t hw       = payload[3];
+
+  printf("[RPLIDAR] Device Info:\r\n");
+  printf("  Model: %u\r\n", model);
+  printf("  FW:    %u.%u\r\n", fw_major, fw_minor);
+  printf("  HW:    %u\r\n", hw);
+  printf("  Serial:");
+  print_serial(&payload[4]);
+  printf("\r\n");
 
   return HAL_OK;
 }
+
 /* USER CODE END 0 */
 
 /**
